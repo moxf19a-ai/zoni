@@ -1,0 +1,223 @@
+// ============================================================================
+// Prisma schema — Milestone 5 (Auth Module) introduces the first real
+// business entities: User and RefreshToken. See docs/database-conventions.md
+// for the full naming/design convention reference this schema follows.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// User — the first entity to require soft delete. This is what activates
+// the generic soft-delete Prisma extension (see
+// infrastructure/database/extensions/soft-delete.extension.ts).
+// ============================================================================
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  fullName     String    @map("full_name")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  refreshTokens RefreshToken[]
+  channelConnections ChannelConnection[]
+  contacts Contact[]
+  conversations Conversation[]
+  subscription Subscription?
+  notifications Notification[]
+
+  @@index([deletedAt])
+  @@map("users")
+}
+
+// ============================================================================
+// RefreshToken — supports multi-device sessions and explicit revocation.
+// Refresh tokens are never soft-deleted; their lifecycle is expiry/
+// revocation (`revokedAt`), a distinct, more precise concept handled
+// explicitly by the Auth module — so this model has no `deletedAt` field
+// and is unaffected by the soft-delete extension.
+// ============================================================================
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ============================================================================
+// ChannelConnection — Milestone 8 (Plugin System). One row per
+// user-connected external channel account (Instagram today; Facebook,
+// WhatsApp, Telegram, TikTok, Email in future milestones — same table,
+// `provider` just gets a new value, no schema change needed per provider).
+//
+// `accessToken` is stored ENCRYPTED (AES-256-GCM, see
+// infrastructure/security/aes-token-cipher.ts) — never in plaintext.
+// This is a genuine access credential (unlike RefreshToken, which is
+// stored as a hash because we only ever need to check equality, never
+// read it back).
+//
+// `@@unique([provider, externalAccountId])`: a given external account
+// (e.g. one specific Instagram Business Account) can only ever be
+// connected to ONE platform user at a time. Without this, two different
+// users could both connect the same external account, and an incoming
+// webhook event would resolve to whichever connection happens to be
+// returned first — silently misattributing messages to the wrong user's
+// inbox (found and fixed during Milestone 9's ingestion pipeline
+// verification; the constraint belongs on this Milestone 8 model since
+// it's this model's own integrity rule, not a Milestone 9 concept).
+// ============================================================================
+model ChannelConnection {
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  provider          String
+  externalAccountId String    @map("external_account_id")
+  accessToken       String    @map("access_token")
+  tokenExpiresAt    DateTime? @map("token_expires_at")
+  status            String    @default("active")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, provider])
+  @@unique([provider, externalAccountId])
+  @@index([userId])
+  @@index([provider])
+  @@index([deletedAt])
+  @@map("channel_connections")
+}
+
+// ============================================================================
+// Contact — Milestone 9 (Core Messaging). A person who has messaged a
+// user's connected channel account. Identity is scoped per (user,
+// provider, externalContactId) — the same real person messaging two
+// different connected accounts is intentionally two separate Contact rows
+// (each account owner manages their own contact list independently).
+// ============================================================================
+model Contact {
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  provider          String
+  externalContactId String    @map("external_contact_id")
+  displayName       String?   @map("display_name")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+  deletedAt         DateTime? @map("deleted_at")
+
+  user          User           @relation(fields: [userId], references: [id])
+  conversations Conversation[]
+
+  @@unique([userId, provider, externalContactId])
+  @@index([userId])
+  @@index([deletedAt])
+  @@map("contacts")
+}
+
+// ============================================================================
+// Conversation — one thread per Contact (Milestone 9 skeleton: a single
+// ongoing conversation per contact; splitting into distinct threads is a
+// future enhancement, not required by this milestone's scope).
+// ============================================================================
+model Conversation {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  contactId     String    @unique @map("contact_id") @db.Uuid
+  provider      String
+  status        String    @default("open")
+  lastMessageAt DateTime? @map("last_message_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  user     User      @relation(fields: [userId], references: [id])
+  contact  Contact   @relation(fields: [contactId], references: [id])
+  messages Message[]
+
+  @@index([userId])
+  @@index([deletedAt])
+  @@map("conversations")
+}
+
+// ============================================================================
+// Message — individual inbound/outbound message. No `deletedAt`: messages
+// are never soft-deleted individually in this milestone (same reasoning
+// as RefreshToken — this model's lifecycle doesn't need it yet; a
+// "delete conversation" feature, if ever added, would act on
+// Conversation, not cascade per-message deletes).
+//
+// `externalMessageId` is `@unique`: Meta (and messaging providers in
+// general) can and do redeliver the same webhook event more than once
+// (at-least-once delivery is the documented guarantee, not
+// exactly-once). Without this constraint, a redelivered webhook would
+// silently create a duplicate message. Postgres allows multiple NULLs in
+// a unique column, so outbound/system messages that never have a
+// provider-assigned id are unaffected.
+// ============================================================================
+model Message {
+  id                String   @id @default(uuid()) @db.Uuid
+  conversationId    String   @map("conversation_id") @db.Uuid
+  direction         String
+  externalMessageId String?  @unique @map("external_message_id")
+  content           String?
+  rawPayload        Json     @map("raw_payload")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+
+  @@index([conversationId])
+  @@map("messages")
+}
+
+// ============================================================================
+// Subscription — Milestone 12 (Billing skeleton). One active subscription
+// per user; no payment gateway integration yet, just plan/status state.
+// ============================================================================
+model Subscription {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @unique @map("user_id") @db.Uuid
+  plan      String    @default("free")
+  status    String    @default("active")
+  periodEnd DateTime? @map("period_end")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("subscriptions")
+}
+
+// ============================================================================
+// Notification — Milestone 12. In-app notifications for a user.
+// ============================================================================
+model Notification {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  type      String
+  message   String
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("notifications")
+}
